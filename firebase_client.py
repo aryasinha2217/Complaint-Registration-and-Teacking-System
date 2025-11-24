@@ -3,38 +3,66 @@ import firebase_admin
 from firebase_admin import credentials, firestore, auth as admin_auth
 import requests
 import os
+import sys
+from datetime import datetime
 
-# ----- CONFIG: Replace by your API key (or export as env var) -----
-# You should set FIREBASE_API_KEY as environment variable or paste it here for quick dev.
-FIREBASE_API_KEY = "AIzaSyD_cc8oQn6dyXYoZHk45VtXCRf7Qo3TMg0"
+# -------------------------------------------------------
+# FIREBASE CONFIG
+# -------------------------------------------------------
 
-# Path to service account JSON (firebase_key.json)
-SERVICE_ACCOUNT_PATH = "firebase_key.json"
+# IMPORTANT: Keep your API key safe.
+# For now it's hardcoded; you can replace with env var later.
+FIREBASE_API_KEY = "<Add your API key>" #
 
-# Initialize firebase-admin
+
+
+# -------------------------------------------------------
+# RESOURCE PATH FIX (supports PyInstaller .exe)
+# -------------------------------------------------------
+def resource_path(filename):
+    """
+    Get absolute path to a bundled resource.
+    Works for development (.py) AND when compiled into .exe.
+    """
+    if hasattr(sys, "_MEIPASS"):
+        # PyInstaller temp folder
+        return os.path.join(sys._MEIPASS, filename)
+    return os.path.join(os.path.abspath("."), filename)
+
+
+SERVICE_ACCOUNT_PATH = resource_path("firebase_key.json")
+
+
+# -------------------------------------------------------
+# FIREBASE ADMIN INITIALIZATION (FireStore)
+# -------------------------------------------------------
 if not firebase_admin._apps:
     cred = credentials.Certificate(SERVICE_ACCOUNT_PATH)
     firebase_admin.initialize_app(cred)
+
 db = firestore.client()
 
 
-# -----------------------
-# Auth via REST (client-side)
-# -----------------------
-# We use Identity Toolkit REST endpoints to sign up / sign in with email/password
-FIREBASE_REST_SIGNUP = f"https://identitytoolkit.googleapis.com/v1/accounts:signUp?key={FIREBASE_API_KEY}"
-FIREBASE_REST_SIGNIN = f"https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key={FIREBASE_API_KEY}"
+# -------------------------------------------------------
+# REST AUTH ENDPOINTS (Signup/Login)
+# -------------------------------------------------------
+FIREBASE_REST_SIGNUP = (
+    f"https://identitytoolkit.googleapis.com/v1/accounts:signUp?key={FIREBASE_API_KEY}"
+)
+
+FIREBASE_REST_SIGNIN = (
+    f"https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key={FIREBASE_API_KEY}"
+)
 
 
+# -------------------------------------------------------
+# AUTH HELPERS
+# -------------------------------------------------------
 def signup_with_email_password(email: str, password: str):
-    """
-    Create a user via Firebase Auth REST API (email & password).
-    Returns the JSON response containing idToken, localId (uid), etc.
-    """
     payload = {
         "email": email,
         "password": password,
-        "returnSecureToken": True
+        "returnSecureToken": True,
     }
     resp = requests.post(FIREBASE_REST_SIGNUP, json=payload)
     resp.raise_for_status()
@@ -42,33 +70,29 @@ def signup_with_email_password(email: str, password: str):
 
 
 def signin_with_email_password(email: str, password: str):
-    """
-    Sign in existing user. Returns JSON with idToken, localId (uid), etc.
-    """
     payload = {
         "email": email,
         "password": password,
-        "returnSecureToken": True
+        "returnSecureToken": True,
     }
     resp = requests.post(FIREBASE_REST_SIGNIN, json=payload)
     resp.raise_for_status()
     return resp.json()
 
 
-# -----------------------
-# Firestore helper methods (server-side via admin SDK)
-# -----------------------
-
-def create_user_doc(uid: str, email: str, name: str, role: str = "user"):
-    """
-    Create a document in users collection to store metadata and role.
-    """
+# -------------------------------------------------------
+# USER HELPERS
+# -------------------------------------------------------
+def create_user_doc(uid: str, email: str, name: str, role="user"):
     doc_ref = db.collection("users").document(uid)
-    doc_ref.set({
-        "email": email,
-        "name": name,
-        "role": role
-    })
+    doc_ref.set(
+        {
+            "email": email,
+            "name": name,
+            "role": role,
+            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+    )
 
 
 def get_user_doc(uid: str):
@@ -81,19 +105,29 @@ def list_all_users():
     return [(u.id, u.to_dict()) for u in users]
 
 
-# Complaint helpers
-
+# -------------------------------------------------------
+# COMPLAINT HELPERS
+# -------------------------------------------------------
 def create_complaint_doc(doc_data: dict):
     """
-    doc_data should include required fields:
-    title, name, email, category, description, priority, status, created_at, created_by_uid
+    doc_data includes:
+        title, description, category, priority,
+        location, contact, status,
+        created_at, created_by_uid, name, email
     """
-    doc_ref = db.collection("complaints").add(doc_data)
-    return doc_ref
+    return db.collection("complaints").add(doc_data)
 
 
 def get_all_complaints():
-    docs = db.collection("complaints").order_by("created_at", direction=firestore.Query.DESCENDING).stream()
+    """
+    'created_at' is stored as a string, so Firestore cannot order by timestamp directly.
+    We save timestamp as string YYYY-MM-DD HH:MM:SS so lexicographic order works.
+    """
+    docs = (
+        db.collection("complaints")
+        .order_by("created_at", direction=firestore.Query.DESCENDING)
+        .stream()
+    )
     return [(d.id, d.to_dict()) for d in docs]
 
 
@@ -103,22 +137,43 @@ def get_complaint(complaint_id: str):
 
 
 def update_complaint_status(complaint_id: str, status: str):
-    db.collection("complaints").document(complaint_id).update({
-        "status": status,
-        "updated_at": firestore.SERVER_TIMESTAMP
-    })
+    """
+    Admin will use this.
+    """
+    db.collection("complaints").document(complaint_id).update(
+        {
+            "status": status,
+            "updated_at": firestore.SERVER_TIMESTAMP,
+        }
+    )
 
 
 def add_complaint_update(complaint_id: str, update_data: dict):
     """
-    Add an update to subcollection 'updates' under the complaint.
-    update_data: status, remark, updated_by_uid, updated_by_name, updated_at (string)
+    update_data MUST include:
+        status
+        remark
+        updated_by_uid
+        updated_by_name
+        updated_at (string: YYYY-MM-DD HH:MM:SS)
     """
-    updates_col = db.collection("complaints").document(complaint_id).collection("updates")
+    updates_col = (
+        db.collection("complaints").document(complaint_id).collection("updates")
+    )
     updates_col.add(update_data)
 
 
 def get_complaint_updates(complaint_id: str):
-    col = db.collection("complaints").document(complaint_id).collection("updates") \
-        .order_by("updated_at", direction=firestore.Query.DESCENDING).stream()
+    """
+    ordered by updated_at DESCENDING
+    Our updated_at is saved as a string "2025-02-24 13:45:55",
+    So ordering works correctly in Firestore.
+    """
+    col = (
+        db.collection("complaints")
+        .document(complaint_id)
+        .collection("updates")
+        .order_by("updated_at", direction=firestore.Query.DESCENDING)
+        .stream()
+    )
     return [(d.id, d.to_dict()) for d in col]
